@@ -1,0 +1,4 @@
+{
+  "node_id": "shanxi-node-example",
+  "allocatable": {"cpu_units": 12, "memory_mib": 12288, "gpu_count": 1}
+}
