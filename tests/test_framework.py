@@ -14,6 +14,19 @@ from bayesdesk.errors import ContractError
 ROOT = Path(__file__).resolve().parents[1]
 SECRET = "fixture-secret-for-tests-12345678"
 SHA = "a" * 40
+PROFILES = {
+    "cpu": {"cpu_units": 2, "memory_mib": 1024, "gpu_count": 0},
+    "gpu": {"cpu_units": 2, "memory_mib": 1024, "gpu_count": 1},
+    "cpu-large": {"cpu_units": 4, "memory_mib": 4096, "gpu_count": 0},
+    "gpu-large": {"cpu_units": 4, "memory_mib": 4096, "gpu_count": 1},
+}
+POLICY = {"recipes": {"smoke.v1": {
+    "profiles": PROFILES,
+    "inputs": {"duration": {"type": "integer", "min": 0, "max": 30},
+               "result": {"type": "enum", "choices": ["pass", "fail"]}},
+    "max_timeout_seconds": 30, "max_attempts": 8
+}}}
+ACCEPT = {"type": "job_exit", "exit_code": 0}
 
 
 class FrameworkTest(unittest.TestCase):
@@ -30,22 +43,30 @@ class FrameworkTest(unittest.TestCase):
                                                "result": {"type": "enum", "flag": "--result", "choices": ["pass", "fail"]}}}},
                              SECRET, base / "jobs", executor_name="local")
         self.leader.approve_decision("D1", "human", "approve baseline tests")
-        self.leader.create_task("T1", "D1", "develop smoke", [], ["never change goal"], {"tests": ["smoke"]})
+        self.leader.create_task("T1", "D1", "develop smoke", [], ["never change goal"], ACCEPT, execution_policy=POLICY)
 
     def _prepare(self, task_id="T1", worker="worker-a", profile=None, inputs=None):
         assignment = self.leader.assign(worker)
         self.assertIsNotNone(assignment)
         self.assertEqual(assignment["task_id"], task_id)
-        profile = profile or {"cpu_units": 2, "memory_mib": 1024, "gpu_count": 0}
+        profile = profile or PROFILES["cpu"]
+        profile_name = next(name for name,p in PROFILES.items() if p == profile)
+        job_inputs = inputs or {"duration": 0, "result": "pass"}
         handoff = self.leader.prepare_handoff(task_id, worker, assignment["generation"],
-                                             "smoke.v1", SHA, {"full": profile})
+                                             "smoke.v1", SHA, {profile_name: profile},
+                                             max_timeout_seconds=10, inputs=job_inputs)
         job = {"schema_version": 1, "handoff_id": handoff["handoff_id"],
                "task_id": task_id, "attempt_id": handoff["attempt_id"], "decision_id": handoff["decision_id"],
                "generation": handoff["generation"], "source_commit": SHA,
-               "recipe_id": "smoke.v1", "inputs": inputs or {"duration": 0, "result": "pass"},
-               "profile_name": "full", "profile": profile, "timeout_seconds": 10,
+               "recipe_id": "smoke.v1", "inputs": job_inputs,
+               "profile_name": profile_name, "profile": profile, "timeout_seconds": 10,
                "permit": handoff["permit"]}
         return assignment, handoff, job
+
+    def _ack(self, handoff, job_id):
+        receipt = self.broker.lookup_handoff(handoff["handoff_id"])["receipt"]
+        self.assertEqual(receipt["job_id"], job_id)
+        return self.leader.acknowledge_handoff(handoff["handoff_id"], receipt)
 
     def _wait_terminal(self, job_id, timeout=8):
         deadline = time.monotonic() + timeout
@@ -61,7 +82,7 @@ class FrameworkTest(unittest.TestCase):
         assignment, handoff, job = self._prepare()
         submitted = self.broker.submit(job)
         self.assertEqual(self.broker.submit(job)["job_id"], submitted["job_id"])
-        self.leader.acknowledge_handoff(handoff["handoff_id"], submitted["job_id"])
+        self._ack(handoff, submitted["job_id"])
         self.assertEqual(self.leader.task("T1")["status"], "WAITING_JOB")
         self.assertEqual(len(self.broker.dispatch()), 1)
         self.assertEqual(self._wait_terminal(submitted["job_id"]), "SUCCEEDED")
@@ -74,23 +95,23 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual(self.leader.task("T1")["status"], "RESULT_READY")
         next_assignment = self.leader.assign("worker-b")
         self.assertGreater(next_assignment["generation"], assignment["generation"])
-        self.leader.complete("T1", "worker-b", next_assignment["generation"], ["job manifest"]) 
+        self.leader.complete("T1", "worker-b", next_assignment["generation"], []) 
         self.assertEqual(self.leader.task("T1")["status"], "DONE")
 
     def test_backfill_gpu_and_cpu_parallel(self):
         _, h1, j1 = self._prepare(profile={"cpu_units": 2, "memory_mib": 1024, "gpu_count": 1},
                                   inputs={"duration": 2, "result": "pass"})
         jid1 = self.broker.submit(j1)["job_id"]
-        self.leader.acknowledge_handoff(h1["handoff_id"], jid1)
-        self.leader.create_task("T2", "D1", "cpu build", [], [], {"test": "pass"})
+        self._ack(h1, jid1)
+        self.leader.create_task("T2", "D1", "cpu build", [], [], ACCEPT, execution_policy=POLICY)
         _, h2, j2 = self._prepare(task_id="T2", profile={"cpu_units": 2, "memory_mib": 1024, "gpu_count": 0},
                                   inputs={"duration": 0, "result": "pass"})
         jid2 = self.broker.submit(j2)["job_id"]
-        self.leader.acknowledge_handoff(h2["handoff_id"], jid2)
-        self.leader.create_task("T3", "D1", "second gpu experiment", [], [], {})
+        self._ack(h2, jid2)
+        self.leader.create_task("T3", "D1", "second gpu experiment", [], [], ACCEPT, execution_policy=POLICY)
         _, h3, j3 = self._prepare(task_id="T3", profile={"cpu_units": 2, "memory_mib": 1024, "gpu_count": 1})
         jid3 = self.broker.submit(j3)["job_id"]
-        self.leader.acknowledge_handoff(h3["handoff_id"], jid3)
+        self._ack(h3, jid3)
         started = self.broker.dispatch()
         self.assertEqual({x["job_id"] for x in started}, {jid1, jid2})
         self.assertEqual(self.broker.status(jid3)["state"], "QUEUED")
@@ -106,11 +127,11 @@ class FrameworkTest(unittest.TestCase):
         _, h1, j1 = self._prepare(profile={"cpu_units": 2, "memory_mib": 1024, "gpu_count": 1},
                                   inputs={"duration": 1, "result": "pass"})
         jid1 = self.broker.submit(j1)["job_id"]
-        self.leader.acknowledge_handoff(h1["handoff_id"], jid1)
-        self.leader.create_task("T2", "D1", "gpu study B", [], [], {})
+        self._ack(h1, jid1)
+        self.leader.create_task("T2", "D1", "gpu study B", [], [], ACCEPT, execution_policy=POLICY)
         _, h2, j2 = self._prepare(task_id="T2", profile={"cpu_units": 2, "memory_mib": 1024, "gpu_count": 1})
         jid2 = self.broker.submit(j2)["job_id"]
-        self.leader.acknowledge_handoff(h2["handoff_id"], jid2)
+        self._ack(h2, jid2)
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(lambda _: self.broker.dispatch(limit=1), range(2)))
         self.assertEqual(sum(len(x) for x in results), 1)
@@ -182,13 +203,13 @@ class FrameworkTest(unittest.TestCase):
         event = self.broker.outbox()[0]
         response = self.leader.ingest_event(event)
         self.assertTrue(response["pending_handoff"])
-        self.leader.acknowledge_handoff(handoff["handoff_id"], accepted["job_id"])
+        self._ack(handoff, accepted["job_id"])
         self.assertEqual(self.leader.task("T1")["status"], "RESULT_READY")
 
     def test_failure_event_not_marked_success(self):
         _, handoff, job = self._prepare(inputs={"duration": 0, "result": "fail"})
         accepted = self.broker.submit(job)
-        self.leader.acknowledge_handoff(handoff["handoff_id"], accepted["job_id"])
+        self._ack(handoff, accepted["job_id"])
         self.broker.dispatch()
         self.assertEqual(self._wait_terminal(accepted["job_id"]), "FAILED")
         self.assertEqual(self.broker.outbox()[0]["type"], "JOB_FAILED")
@@ -197,8 +218,9 @@ class FrameworkTest(unittest.TestCase):
 
     def test_escalation_requires_human_decision(self):
         assigned = self.leader.assign("worker-a")
+        ev = self.leader.record_evidence("T1", "worker-a", assigned["generation"], "diagnostic", "tested alternative A")
         esc = self.leader.escalate("T1", "worker-a", assigned["generation"],
-                                   "Is changing the model architecture permitted?", ["tested alternative A"], ["EV-11"])
+                                   "Is changing the model architecture permitted?", ["tested alternative A"], [ev["evidence_id"]])
         self.assertEqual(self.leader.task("T1")["status"], "BLOCKED")
         self.assertIsNone(self.leader.assign("worker-b"))
         self.leader.resolve_escalation(esc["escalation_id"], "D2", "human", "approve experiment change")
@@ -206,16 +228,22 @@ class FrameworkTest(unittest.TestCase):
         self.assertIsNotNone(self.leader.assign("worker-b"))
 
     def test_dependency_blocks_task_until_accepted_completion(self):
-        self.leader.create_task("T2", "D1", "dependent", ["T1"], [], {})
-        first = self.leader.assign("worker-a")
-        self.assertEqual(first["task_id"], "T1")
-        self.leader.complete("T1", "worker-a", first["generation"], ["acceptance.json"])
-        self.assertEqual(self.leader.assign("worker-b")["task_id"], "T2")
+        self.leader.create_task("T2", "D1", "dependent", ["T1"], [], ACCEPT, execution_policy=POLICY)
+        _, h, j = self._prepare()
+        got = self.broker.submit(j)
+        self._ack(h, got["job_id"])
+        self.broker.dispatch()
+        self._wait_terminal(got["job_id"])
+        self.leader.ingest_event(self.broker.outbox()[0])
+        a = self.leader.assign("worker-b")
+        self.assertEqual(a["task_id"], "T1")
+        self.leader.complete("T1", "worker-b", a["generation"], [])
+        self.assertEqual(self.leader.assign("worker-c")["task_id"], "T2")
 
     def test_event_signature_rejects_tamper(self):
         _, handoff, job = self._prepare()
         accepted = self.broker.submit(job)
-        self.leader.acknowledge_handoff(handoff["handoff_id"], accepted["job_id"])
+        self._ack(handoff, accepted["job_id"])
         self.broker.dispatch()
         self._wait_terminal(accepted["job_id"])
         event = self.broker.outbox()[0]
@@ -238,10 +266,14 @@ class FrameworkTest(unittest.TestCase):
         self.assertEqual(pool.tick(), [])
 
     def test_stale_worker_fencing(self):
-        first = self.leader.assign("worker-a")
-        self.leader.complete("T1", "worker-a", first["generation"], ["check"])
+        from bayesdesk.storage import connect, write_tx
+        a = self.leader.assign("worker-a")
+        with connect(self.leader.path) as db, write_tx(db):
+            db.execute("UPDATE tasks SET lease_expires_at=0 WHERE id='T1'")
+        self.leader.requeue_expired()
+        self.leader.assign("worker-b")
         with self.assertRaises(ContractError) as ctx:
-            self.leader.escalate("T1", "worker-a", first["generation"], "old", [], ["x"])
+            self.leader.escalate("T1", "worker-a", a["generation"], "old", [], ["fake"])
         self.assertEqual(ctx.exception.code, "STALE_ASSIGNMENT")
 
 

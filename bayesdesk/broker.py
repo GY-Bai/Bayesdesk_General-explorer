@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 
-from .contracts import validate_job, verify_permit, payload_fingerprint, resource_profile, sign_event
+from .contracts import validate_job, verify_permit, payload_fingerprint, resource_profile, sign_event, sign_receipt
 from .errors import ContractError, require
 from .executors import get_executor
 from .job_entry import atomic_json
@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS jobs(
   job_id TEXT PRIMARY KEY, handoff_id TEXT UNIQUE NOT NULL, payload_hash TEXT NOT NULL,
   task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, decision_id TEXT NOT NULL,
   recipe_id TEXT NOT NULL, spec_json TEXT NOT NULL,
+  recipe_hash TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0,
   cpu_units INTEGER NOT NULL, memory_mib INTEGER NOT NULL, gpu_count INTEGER NOT NULL,
   unit_name TEXT NOT NULL, executor_meta TEXT, last_error TEXT,
@@ -55,6 +56,11 @@ class Broker:
         self.executor = get_executor(executor_name)
         with connect(self.path) as db:
             db.executescript(SCHEMA)
+            columns = {r["name"] for r in db.execute("PRAGMA table_info(jobs)")}
+            if "recipe_hash" not in columns:
+                # Retain V0.1 jobs. Unknown original recipe version cannot be
+                # retroactively attested; legacy jobs need operator review.
+                db.execute("ALTER TABLE jobs ADD COLUMN recipe_hash TEXT NOT NULL DEFAULT ''")
 
     def _usage(self, db) -> dict:
         row = db.execute("SELECT COALESCE(SUM(cpu_units),0) AS cpu, COALESCE(SUM(memory_mib),0) AS mem, COALESCE(SUM(gpu_count),0) AS gpu FROM jobs WHERE state IN ('STARTING','RUNNING','UNKNOWN')").fetchone()
@@ -76,6 +82,25 @@ class Broker:
                 "never_fits_node": never_fit, "profile": profile,
                 "available_snapshot": info["available"], "binding": False}
 
+    @staticmethod
+    def _receipt(row: dict, secret: str) -> dict:
+        spec = json.loads(row["spec_json"])
+        return sign_receipt(secret, {
+            "job_id": row["job_id"], "handoff_id": row["handoff_id"],
+            "task_id": row["task_id"], "attempt_id": row["attempt_id"],
+            "decision_id": row["decision_id"], "source_commit": spec["source_commit"],
+            "job_fingerprint": row["payload_hash"],
+        })
+
+    def lookup_handoff(self, handoff_id: str) -> dict | None:
+        """Authenticated transport required remotely; a missing row is meaningful only if connected."""
+        from .contracts import validate_id
+        validate_id(handoff_id, "handoff_id")
+        with connect(self.path) as db:
+            row = db.execute("SELECT * FROM jobs WHERE handoff_id=?", (handoff_id,)).fetchone()
+            return {"job_id": row["job_id"], "state": row["state"],
+                    "receipt": self._receipt(row, self.secret)} if row else None
+
     def submit(self, job: dict) -> dict:
         validate_job(job)
         require(job["recipe_id"] in self.recipes, "RECIPE_NOT_REGISTERED", "unknown trusted recipe")
@@ -88,15 +113,19 @@ class Broker:
             prev = db.execute("SELECT * FROM jobs WHERE handoff_id=?", (job["handoff_id"],)).fetchone()
             if prev:
                 require(prev["payload_hash"] == fingerprint, "IDEMPOTENCY_CONFLICT", "handoff ID used with different job")
-                return {"job_id": prev["job_id"], "state": prev["state"], "deduplicated": True}
+                return {"job_id": prev["job_id"], "state": prev["state"], "deduplicated": True,
+                        "receipt": self._receipt(prev, self.secret)}
             verify_permit(self.secret, job)
             job_id = "JOB-" + uuid.uuid4().hex[:20]
             unit = "bayesdesk-" + job_id.lower()
             p = job["profile"]
-            db.execute("INSERT INTO jobs(job_id,handoff_id,payload_hash,task_id,attempt_id,decision_id,recipe_id,spec_json,state,cpu_units,memory_mib,gpu_count,unit_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO jobs(job_id,handoff_id,payload_hash,task_id,attempt_id,decision_id,recipe_id,spec_json,recipe_hash,state,cpu_units,memory_mib,gpu_count,unit_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                        (job_id, job["handoff_id"], fingerprint, job["task_id"], job["attempt_id"], job["decision_id"],
-                        job["recipe_id"], dumps(job), "QUEUED", p["cpu_units"], p["memory_mib"], p["gpu_count"], unit, utcnow(), utcnow()))
-            return {"job_id": job_id, "state": "QUEUED", "deduplicated": False}
+                        job["recipe_id"], dumps(job), payload_fingerprint(self.recipes[job["recipe_id"]]),
+                        "QUEUED", p["cpu_units"], p["memory_mib"], p["gpu_count"], unit, utcnow(), utcnow()))
+            row = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            return {"job_id": job_id, "state": "QUEUED", "deduplicated": False,
+                    "receipt": self._receipt(row, self.secret)}
 
     def status(self, job_id: str) -> dict:
         with connect(self.path) as db:
@@ -115,6 +144,9 @@ class Broker:
                  "type": "JOB_SUCCEEDED" if state == "SUCCEEDED" else "JOB_FAILED" if state == "FAILED" else "JOB_LOST",
                  "task_id": row["task_id"], "handoff_id": row["handoff_id"],
                  "payload": {"result": manifest, "node_id": self.node_id,
+                             "attempt_id": row["attempt_id"], "recipe_id": row["recipe_id"],
+                             "source_commit": json.loads(row["spec_json"])["source_commit"],
+                             "job_fingerprint": row["payload_hash"],
                              "evidence_ref": str(self._job_dir(row["job_id"]) / "result.json")}}
         event = sign_event(self.secret, event)
         db.execute("INSERT INTO event_outbox VALUES(?,?,?,?,?)", (event["event_id"], row["job_id"], dumps(event), None, utcnow()))
@@ -132,9 +164,22 @@ class Broker:
                         manifest = json.loads(result.read_text())
                         require(manifest["job_id"] == row["job_id"] and manifest["state"] in ("SUCCEEDED", "FAILED"),
                                 "INVALID_MANIFEST", "job result inconsistent")
+                        require(type(manifest.get("exit_code")) is int and
+                                (manifest["exit_code"] == 0) == (manifest["state"] == "SUCCEEDED"),
+                                "INVALID_MANIFEST", "result state and exit code disagree")
                     except (ValueError, KeyError, ContractError):
                         db.execute("UPDATE jobs SET state='UNKNOWN',last_error=?,updated_at=? WHERE job_id=?",
                                    ("INVALID_RESULT_MANIFEST", utcnow(), row["job_id"]))
+                        continue
+                    # A result file alone is insufficient to release the
+                    # reservation. A live unit (or malicious child) may have
+                    # written it early while still consuming CPU/GPU.
+                    live = self.executor.alive(row["unit_name"], folder)
+                    if live is True:
+                        continue
+                    if live is None:
+                        db.execute("UPDATE jobs SET state='UNKNOWN',last_error=?,updated_at=? WHERE job_id=?",
+                                   ("RESULT_WITH_UNKNOWN_PROCESS", utcnow(), row["job_id"]))
                         continue
                     self.executor.reap(row["unit_name"])
                     self._record_terminal(db, row, manifest["state"], manifest)
@@ -189,7 +234,14 @@ class Broker:
                 spec = json.loads(chosen["spec_json"])
                 folder = self._job_dir(chosen["job_id"])
                 folder.mkdir(parents=True, exist_ok=True)
-                argv, cwd = render_recipe(self.recipes[chosen["recipe_id"]], spec["inputs"])
+                require(chosen["recipe_hash"] and
+                        chosen["recipe_hash"] == payload_fingerprint(self.recipes[chosen["recipe_id"]]),
+                        "RECIPE_VERSION_CHANGED", "recipe changed since Job submission; require operator review")
+                recipe = self.recipes[chosen["recipe_id"]]
+                argv, cwd = render_recipe(recipe, spec["inputs"])
+                from .recipes import materialize_source
+                cwd = materialize_source(recipe, spec["source_commit"], folder, cwd,
+                                         require_pinned=self.executor.name == "systemd-user")
                 entry = folder / "entry.json"
                 atomic_json(entry, {"job_id": chosen["job_id"], "job_dir": str(folder),
                                     "argv": argv, "cwd": cwd, "timeout_seconds": spec["timeout_seconds"]})
@@ -200,9 +252,10 @@ class Broker:
                 launches.append({"job_id": chosen["job_id"], "state": "RUNNING"})
             except Exception as exc:
                 # Do not automatically retry: side effect may have occurred before acknowledgment.
+                error_code = exc.code if isinstance(exc, ContractError) else "LAUNCH_UNCERTAIN"
                 with connect(self.path) as db, write_tx(db):
                     db.execute("UPDATE jobs SET state='UNKNOWN',last_error=?,updated_at=? WHERE job_id=?",
-                               (f"LAUNCH_UNCERTAIN:{exc}", utcnow(), chosen["job_id"]))
+                               (f"{error_code}:{exc}", utcnow(), chosen["job_id"]))
                 launches.append({"job_id": chosen["job_id"], "state": "UNKNOWN"})
         return launches
 

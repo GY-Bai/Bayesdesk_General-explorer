@@ -34,17 +34,17 @@ def main(argv=None):
     leader = actions.add_parser("leader")
     lead = leader.add_subparsers(dest="action", required=True)
     for name in ["decision", "task-create", "task", "tasks", "assign", "handoff-prepare", "handoff-ack",
-                 "complete", "escalate", "escalation-resolve", "ingest-event", "events", "renew", "requeue-expired"]:
+                 "complete", "human-complete", "escalate", "escalation-resolve", "ingest-event", "events", "renew", "requeue-expired", "reconcile-handoffs", "evidence-add", "evidence-read", "lesson-propose", "lesson-verify", "lesson-approve", "knowledge-search"]:
         sp = lead.add_parser(name)
-        if name not in ("tasks", "assign", "requeue-expired"):
+        if name not in ("tasks", "assign", "requeue-expired", "reconcile-handoffs"):
             sp.add_argument("data", help="JSON object or @filename (except task/events: use task ID string)")
         if name == "assign":
             sp.add_argument("worker_id")
     broker = actions.add_parser("broker")
     br = broker.add_subparsers(dest="action", required=True)
-    for name in ["inspect", "quote", "submit", "status", "tick", "outbox", "delivered", "release-unknown", "serve"]:
+    for name in ["inspect", "quote", "submit", "status", "lookup-handoff", "tick", "outbox", "delivered", "release-unknown", "serve"]:
         sp = br.add_parser(name)
-        if name in ("quote", "submit", "status", "delivered", "release-unknown"):
+        if name in ("quote", "submit", "status", "lookup-handoff", "delivered", "release-unknown"):
             sp.add_argument("data", help="JSON/@filename for quote,submit,release-unknown; otherwise string ID")
         if name == "serve":
             sp.add_argument("--interval", type=float, default=5)
@@ -53,6 +53,9 @@ def main(argv=None):
     pool.add_argument("--capsules", default="./state/capsules")
     pool.add_argument("--once", action="store_true")
     pool.add_argument("--interval", type=float, default=5)
+    coordination = actions.add_parser("coordinator", help="trusted LOCAL handoff/event reconciliation")
+    coordination.add_argument("--once", action="store_true")
+    coordination.add_argument("--interval", type=float, default=5)
     actions.add_parser("bridge-pump", help="development only: transfer events between two local DBs")
     args = p.parse_args(argv)
     try:
@@ -65,6 +68,13 @@ def main(argv=None):
                 out = ctl.requeue_expired()
             elif a == "assign":
                 out = ctl.assign(args.worker_id)
+            elif a == "reconcile-handoffs":
+                node = parse_json("@" + args.node_config)
+                recipes = parse_json("@" + args.recipes)
+                broker = Broker(args.broker_db, node, recipes, secret(), args.jobs_root, args.executor)
+                out = ctl.reconcile_handoffs(broker)  # local only; remote transport must authenticate
+            elif a == "evidence-read":
+                out = ctl.read_evidence(args.data)
             elif a in ("task", "events"):
                 out = ctl.task(args.data) if a == "task" else ctl.events(args.data)
             else:
@@ -75,6 +85,12 @@ def main(argv=None):
                     "handoff-prepare": lambda: ctl.prepare_handoff(**data),
                     "handoff-ack": lambda: ctl.acknowledge_handoff(**data),
                     "complete": lambda: ctl.complete(**data),
+                    "human-complete": lambda: ctl.human_complete(**data),
+                    "evidence-add": lambda: ctl.record_evidence(**data),
+                    "lesson-propose": lambda: ctl.propose_lesson(**data),
+                    "lesson-verify": lambda: ctl.verify_lesson(**data),
+                    "lesson-approve": lambda: ctl.approve_lesson(**data),
+                    "knowledge-search": lambda: ctl.knowledge_search(**data),
                     "renew": lambda: ctl.renew(**data),
                     "escalate": lambda: ctl.escalate(**data),
                     "escalation-resolve": lambda: ctl.resolve_escalation(**data),
@@ -89,6 +105,7 @@ def main(argv=None):
             elif a == "quote": out = ctl.quote(parse_json(args.data))
             elif a == "submit": out = ctl.submit(parse_json(args.data))
             elif a == "status": out = ctl.status(args.data)
+            elif a == "lookup-handoff": out = ctl.lookup_handoff(args.data)
             elif a == "tick": out = ctl.tick()
             elif a == "outbox": out = ctl.outbox()
             elif a == "delivered":
@@ -103,6 +120,22 @@ def main(argv=None):
                     if outcome["finished"] or outcome["launched"]:
                         print(json.dumps(outcome), flush=True)
                     time.sleep(args.interval)  # plain daemon timer; no model sessions
+        elif args.system == "coordinator":
+            from .coordinator import LocalCoordinator
+            node = parse_json("@" + args.node_config)
+            recipes = parse_json("@" + args.recipes)
+            service = LocalCoordinator(Leader(args.leader_db, secret()),
+                                       Broker(args.broker_db, node, recipes, secret(), args.jobs_root, args.executor))
+            if args.once:
+                out = service.tick()
+            else:
+                if args.interval < 1:
+                    raise ContractError("INVALID_INTERVAL", "interval must be >=1s")
+                while True:
+                    change = service.tick()
+                    if change["events_delivered"] or change["handoffs"]["recovered"] or change["handoffs"]["aborted"] or change["expired_assignments"]:
+                        print(json.dumps(change), flush=True)
+                    time.sleep(args.interval)
         elif args.system == "worker-pool":
             from .worker_pool import WorkerPool
             ctl = WorkerPool(Leader(args.leader_db, secret()), parse_json("@" + args.config), args.capsules)

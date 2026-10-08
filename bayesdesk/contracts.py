@@ -65,7 +65,7 @@ def verify_permit(secret: str, job: dict) -> None:
     exact_keys(permit, {"claims", "signature"})
     claims = permit["claims"]
     exact_keys(claims, {"handoff_id", "task_id", "attempt_id", "decision_id", "generation",
-                        "recipe_id", "source_commit", "allowed_profiles", "max_timeout_seconds", "expires_at"})
+                        "recipe_id", "source_commit", "allowed_profiles", "max_timeout_seconds", "expires_at", "inputs_fingerprint"})
     expected = sign_permit(secret, claims)["signature"]
     require(isinstance(permit["signature"], str) and hmac.compare_digest(permit["signature"], expected),
             "INVALID_PERMIT", "permit signature mismatch")
@@ -73,6 +73,8 @@ def verify_permit(secret: str, job: dict) -> None:
             "EXPIRED_PERMIT", "worker handoff permit expired")
     for key in ("handoff_id", "task_id", "attempt_id", "decision_id", "generation", "recipe_id", "source_commit"):
         require(job[key] == claims[key], "INVALID_PERMIT", f"permit does not authorize {key}")
+    require(claims["inputs_fingerprint"] == payload_fingerprint(job["inputs"]),
+            "INPUT_NOT_APPROVED", "job inputs changed since the signed handoff")
     profiles = claims["allowed_profiles"]
     require(isinstance(profiles, dict) and job["profile_name"] in profiles,
             "PROFILE_NOT_APPROVED", "resource profile not approved")
@@ -99,3 +101,18 @@ def verify_event(secret: str, event: dict) -> None:
     expected = sign_event(secret, event)["signature"]
     require(hmac.compare_digest(event["signature"], expected),
             "INVALID_EVENT_SIGNATURE", "event signature mismatch")
+
+
+def sign_receipt(secret: str, receipt: dict) -> dict:
+    """Broker acceptance proof; distinguish from a Worker-provided job identifier."""
+    return sign_event(secret, receipt)
+
+
+def verify_receipt(secret: str, receipt: dict) -> None:
+    exact_keys(receipt, {"job_id", "handoff_id", "task_id", "attempt_id",
+                         "decision_id", "source_commit", "job_fingerprint", "signature"})
+    verify_event(secret, receipt)
+    for key in ("job_id", "handoff_id", "task_id", "attempt_id", "decision_id"):
+        validate_id(receipt[key], key)
+    require(isinstance(receipt["job_fingerprint"], str) and HEX64.fullmatch(receipt["job_fingerprint"]),
+            "INVALID_RECEIPT", "invalid job fingerprint")

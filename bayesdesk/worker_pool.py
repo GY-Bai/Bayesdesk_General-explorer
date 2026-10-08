@@ -6,6 +6,7 @@ handoff/complete/escalate and periodic lease renewal. This code does no research
 """
 from __future__ import annotations
 import json
+import os
 from pathlib import Path
 import subprocess
 import threading
@@ -15,15 +16,30 @@ from .errors import ContractError, require
 from .job_entry import atomic_json
 from .leader import Leader
 
+# The process that signs Broker permits is privileged. The LLM worker is not.
+# Do not copy the supervisor's arbitrary environment into an Agent process.
+# Operators may explicitly add provider-specific credentials via env_allowlist.
+DEFAULT_WORKER_ENV = frozenset({
+    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP",
+    "USER", "LOGNAME", "SHELL", "TERM", "PYTHONPATH", "VIRTUAL_ENV",
+})
+FORBIDDEN_WORKER_ENV = frozenset({"BAYESDESK_SHARED_SECRET", "BAYESDESK_OPERATOR_TOKEN"})
+
 
 class WorkerPool:
     def __init__(self, leader: Leader, config: dict, capsules_root: str | Path):
-        require(isinstance(config, dict) and set(config) == {"workers", "max_concurrent"},
+        require(isinstance(config, dict) and {"workers", "max_concurrent"} <= set(config)
+                and set(config) <= {"workers", "max_concurrent", "env_allowlist"},
                 "INVALID_WORKER_CONFIG", "expected workers and max_concurrent")
         require(type(config["max_concurrent"]) is int and config["max_concurrent"] >= 1,
                 "INVALID_WORKER_CONFIG", "max_concurrent must be positive")
         self.leader = leader
         self.config = config
+        extra = config.get("env_allowlist", [])
+        require(isinstance(extra, list) and all(isinstance(x, str) and x.isidentifier() for x in extra)
+                and not (set(extra) & FORBIDDEN_WORKER_ENV),
+                "INVALID_WORKER_CONFIG", "invalid or privileged worker environment variable")
+        self.env_keys = DEFAULT_WORKER_ENV | set(extra)
         self.capsules_root = Path(capsules_root).resolve()
         self.capsules_root.mkdir(parents=True, exist_ok=True)
         self.children: dict[str, subprocess.Popen] = {}
@@ -56,7 +72,10 @@ class WorkerPool:
             task = self.leader.task(claim["task_id"])
             capsule = self.capsules_root / f"{claim['task_id']}-g{claim['generation']}.json"
             # Context Capsule is data only. The worker command never comes from this capsule.
+            relevant_lessons = self.leader.knowledge_search(task["knowledge_scope"]) if task["knowledge_scope"] else []
             atomic_json(capsule, {
+                "knowledge_scope": task["knowledge_scope"], "lessons": relevant_lessons[:15],
+                "execution_policy": task["execution_policy"],
                 "schema_version": 1, "task_id": task["id"], "worker_id": name,
                 "generation": claim["generation"], "decision_id": task["decision_id"],
                 "objective": task["objective"], "constraints": task["constraints"],
@@ -66,8 +85,10 @@ class WorkerPool:
             command = [a.replace("{capsule}", str(capsule)) for a in argv]
             try:
                 with (self.capsules_root / f"{claim['task_id']}-g{claim['generation']}.launcher.log").open("ab") as log:
+                    # Signing and operator secrets belong to trusted control services, NEVER the LLM Worker.
+                    safe_env = {k:v for k,v in os.environ.items() if k in self.env_keys}
                     proc = subprocess.Popen(command, cwd=str(cwd), stdin=subprocess.DEVNULL,
-                                            stdout=log, stderr=log, close_fds=True)
+                                            stdout=log, stderr=log, close_fds=True, env=safe_env)
                 self.children[name] = proc
                 threading.Thread(target=proc.wait, daemon=True).start()
                 started.append({"worker_id": name, "task_id": task["id"], "generation": claim["generation"], "pid": proc.pid})

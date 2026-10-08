@@ -1,6 +1,6 @@
-# Bayesdesk General Explorer — Architecture Decision Record v0.1
+# Bayesdesk General Explorer — Architecture Decision Record v0.2
 
-Date: 2026-10-08. Status: **prototype with tested local contract paths**, not production-certified.
+Date: 2026-10-08. Status: **hardened prototype with tested local contract paths**, not production-certified.
 
 ## 1. Why this project exists
 
@@ -98,7 +98,7 @@ All integer budgets are accounting quantities, **not observed CPU%**. `cpu_units
 
 ### Typed recipe
 
-Node administrator registers an immutable `recipe_id` with a fixed `argv` prefix, a trusted `cwd`, and typed input parameters. Only `integer`, `enum` and rooted `path` are supported. No shell interpolation or free-form argv accepted from Workers. A recipe upgrade must produce a new version (`training.v2`, etc). V1 logs a Git SHA but **does not yet check out immutable code by that SHA**: production work must add verified worktree/container materialization before executing untrusted model-produced code.
+Node administrator registers an immutable `recipe_id` with a fixed `argv` prefix, a trusted `cwd`, and typed input parameters. Only `integer`, `enum` and rooted `path` are supported. No shell interpolation or free-form argv accepted from Workers. A recipe upgrade must produce a new version (`training.v2`, etc). V0.2 can materialize an exact source commit into a per-Job Git worktree when Recipe `source` is configured. The `systemd-user` executor requires this pinning; the local smoke-test executor may omit it. Pinned source alone does **not** pin Python/CUDA dependencies or datasets.
 
 ### Scheduling policy
 
@@ -122,7 +122,7 @@ Exact keys:
 
 `schema_version`, `handoff_id`, `task_id`, `attempt_id`, `decision_id`, `generation`, `source_commit`, `recipe_id`, `inputs`, `profile_name`, `profile`, `timeout_seconds`, `permit`.
 
-A permit is an HMAC-SHA256 over immutable claims: handoff, task, attempt, Decision, Worker generation, recipe, **source commit**, approved profiles, max walltime and expiry. Broker validates its signature and selected resources. Worker cannot submit arbitrary NLP text as executable instructions.
+A permit is an HMAC-SHA256 over immutable claims: handoff, task, attempt, Decision, Worker generation, recipe, **source commit, exact input fingerprint**, approved profiles, max walltime and expiry. `execution_policy` supplies operator-approved recipe/input/profile/budget constraints. Broker validates its signature and selected resources. Worker cannot submit arbitrary NLP text as executable instructions.
 
 ### Escalation Contract
 
@@ -134,7 +134,7 @@ A permit is an HMAC-SHA256 over immutable claims: handoff, task, attempt, Decisi
 2. Worker edits approved files in isolated worktree and writes Attempt/Evidence; inspect/quote only to learn resource options.
 3. Worker chooses approved profile and calls `handoff-prepare`. Coordinator persists handoff and returns a signed permit.
 4. Worker posts job to **node** Broker; Broker persists it and returns Job ID. Exact duplicates return the same ID; modified duplicates are rejected.
-5. Worker calls `handoff-ack`. Coordinator transitions to `WAITING_JOB`; Worker **exits**. If acknowledgement was lost, query Broker by handoff/idempotency key; do not blindly create another job. V1 is missing this query-by-handoff CLI and requires explicit reconciliation in this ambiguous window.
+5. Worker calls `handoff-ack`. Coordinator transitions to `WAITING_JOB`; Worker **exits**. If acknowledgement was lost, use `broker lookup-handoff` and `leader reconcile-handoffs` (local trusted CLI only), verifying the signed Broker receipt. Never blindly create a new Job. Remote reconciler transport is a deployment adapter milestone.
 6. Node supervisor runs independently. `systemd-run --user` is the deployment backend; a `local` detached process backend exists solely for tests/dev and cannot strongly enforce quotas or reliable reattachment.
 7. Job writes atomic result. Broker emits signed terminal event into outbox. Local forwarder or future network bridge delivers event.
 8. Coordinator receives terminal event and changes Task to `RESULT_READY`. Next short-lived Worker instance is dispatched to evaluate, debug or finish. **No LLM remains active during Job execution.**
@@ -144,7 +144,7 @@ Broker supervisor polling uses `time.sleep` in a normal daemon, not inside an LL
 
 ## 7. Knowledge model
 
-Separate (A) machine observations (`exit_code`, stderr, metrics, versioned configuration, logs), (B) Worker hypotheses/attempt narratives and (C) validated lessons with explicit scope and contradictory evidence. The implementation currently covers the raw machine manifest and Task audit/event linkage; it **does not yet implement a validated lesson promotion engine**, semantic similarity search or ARTEX-style graph compaction. Next iterations can model `Attempt --produced--> Evidence --supports/refutes--> Hypothesis --validated-as--> Lesson` and preserve temporal ordering as in Cairn.
+Separate (A) machine observations (`exit_code`, stderr, metrics, versioned configuration, logs), (B) Worker hypotheses/attempt narratives and (C) validated lessons with explicit scope and contradictory evidence. V0.2 records content-addressed small Worker evidence, scopes Candidate lessons, requires independent verification before `PEER_CHECKED`, and requires operator promotion before `VERIFIED`. It **does not yet** implement semantic similarity, automatic retraction, signed remote raw artifact manifests or ARTEX-style graph compaction. Next iterations can model `Attempt --produced--> Evidence --supports/refutes--> Hypothesis --validated-as--> Lesson` and preserve temporal ordering as in Cairn.
 
 Prior-art references: [ARTEX](https://github.com/Autumn-27/ARTEX), [Cairn](https://github.com/oritera/Cairn), [OpenAI Symphony](https://github.com/openai/symphony), [Herdr](https://github.com/herdrdev/herdr). These inspired boundaries; no source code is copied. Distinguish implemented components from ideas.
 
@@ -153,21 +153,32 @@ Prior-art references: [ARTEX](https://github.com/Autumn-27/ARTEX), [Cairn](https
 - Shared signing secret (`BAYESDESK_SHARED_SECRET`) is for prototype permits/events, not full host-to-host mutual authentication. Use secret manager, TLS/mTLS and rotation in production; protect SQLite and broker socket from untrusted writers.
 - Worker filesystem access should be restricted to an isolated worktree. A Worker with unrestricted shell/root access can bypass any broker; do not rely on prompt obedience. Execution of Worker-authored code should run under a restricted OS identity/container.
 - `systemd-user` backend requires active user systemd manager and lingering for offline jobs; GPU device access/quotas must be separately enforced. `MemoryMax`/`CPUQuota` are not GPU VRAM enforcement.
-- For source integrity, production Broker should verify the commit/config hash and materialize a pinned checkout/container. Current execution uses a trusted recipe with existing working directory, so **not suitable for untrusted production use**.
+- For source integrity, V0.2 optionally materializes a pinned Git worktree and requires it with the systemd executor; environment, dataset/config hashes, artifact verification, container isolation and production identity are still missing. **Do not deploy untrusted code until these are enforced.**
 - A claimed Worker can time out during implementation. `requeue_expired` fences the old generation. The claim is not a distributed lock on an external git branch: independent worktrees and protected integration are also necessary.
 - A job in `UNKNOWN` reserves resources until explicit recovery. This sacrifices some utilization to prevent accidental double execution; operator intervention is required.
-- Read-only task references and content-addressed Artifact Store, outbox network transport, structured Worker reasoning, verified lessons, CGroup GPU isolation, dynamic worker pool/process adapter and Postgres control plane are **next milestones, not features already delivered**.
+- Remote artifact replication, authenticated outbox network transport, scientific metrics-based acceptance, full causal/temporal knowledge graph, enforced GPU device isolation, production Claude/Codex adapter and Postgres control plane are **future work, not V0.2 capabilities**.
 
 ## 9. Implementation/verification milestones
 
-**M0 (delivered):** executable Python stdlib protocol skeleton; SQLite leader; permit-bound job handoff; typed recipes; broker quote/submit; atomic multi-resource admission/backfill; detached/systemd launch adapters; result manifests; signed events; inbox dedup; basic opt-in short-lived Worker launcher and Context Capsule; escalation; tests.
+**M0 (delivered with V0.2 security and knowledge extensions):** executable Python stdlib protocol skeleton; SQLite leader; permit-bound job handoff; typed recipes; broker quote/submit; atomic multi-resource admission/backfill; detached/systemd launch adapters; result manifests; signed events; inbox dedup; basic opt-in short-lived Worker launcher and Context Capsule; escalation; tests.
 
-**M1 (next):** read actual Shanxi queue shell script, preserve compatibility; onboard host and create trusted training recipes; correct `systemd` service user setup; simulate power loss and startup crash windows; automatic prepared-handoff reconciliation; production Worker CLI skills/permission adapter, token budgets and Context Capsule retrieval; evidence object store.
+**M1 (next):** read actual Shanxi queue shell script, preserve compatibility; onboard host and create trusted training recipes; correct `systemd` service user setup; simulate power loss and startup crash windows; remote prepared-handoff reconciliation transport; production Worker CLI skills/permission adapter, token budgets and Context Capsule retrieval; remote artifact replication.
 
-**M2:** Japan OCI endpoint/mTLS and persistent event forwarding; PostgreSQL control plane; Gitea PR/CI adapter; verified source worktrees; structured diagnostics and resource budgeting; validated negative-knowledge lookup.
+**M2:** Japan OCI endpoint/mTLS and persistent event forwarding; PostgreSQL control plane; Gitea PR/CI adapter; pinned environment/dataset manifests; structured diagnostics, signed raw artifacts and full negative-knowledge applicability/retraction.
 
 **M3:** empirically justified quotas, aging/priority experiments, checkpoint resume, per-run experiment verification and cold/semantic graph compaction.
 
 ## 10. Explicit non-goals
 
 No autonomous deep research, no Agent Teams conversations, no NLP inside Broker, no automatic architecture changes, no blind resubmission of UNKNOWN jobs, no claim that CI success proves research success, no GPU overcommit or automatic trial parameter shrinkage, no exact-once distributed transaction guarantee.
+
+## 11. V0.2 hardening and verified scope
+
+- **Machine policy:** `execution_policy` is captured at human-approved Task creation, with allowed Recipes, resource Profiles, exact/enum/bounded integer inputs, max walltime, max Attempts and optional source SHA allowlist. A signed Handoff Permit commits to an exact input fingerprint.
+- **Handoff:** Broker returns a signed receipt; Leader rejects fabricated Job IDs. A trusted local reconciler queries `handoff_id`, verifies receipt and recovers lost ACKs without replay. Remote authentication remains an adaptation task.
+- **Acceptance:** `job_exit` validates the signed terminal Job result against the Task predicate. `evidence_only` requires operator-controlled `human_complete` plus registered Evidence. Exit success is not science proof.
+- **Evidence:** small Worker notes are SHA-256-addressed and checked on read and acceptance; large GPU artifacts still need remote hash manifests and replication.
+- **Knowledge:** `CANDIDATE -> PEER_CHECKED -> VERIFIED`; independent Worker+Task+Job result and human promotion required. Retrieval uses exact field/value knowledge scopes, not semantic search.
+- **Security:** default Worker subprocess env is an allowlist; privileges require separate Unix users/authenticated service wrappers because in-process Python and the CLI do not themselves provide a production identity boundary.
+
+See `docs/DESIGN_RATIONALE.md` for derivation, `docs/ADAPTER_HANDOFF.md` for implementation boundaries.

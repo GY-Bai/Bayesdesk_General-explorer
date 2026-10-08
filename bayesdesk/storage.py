@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
+import os
 import json
 from datetime import datetime, timezone
 
@@ -21,6 +22,13 @@ def connect(path: str | Path):
     file = Path(path).expanduser()
     file.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(file), timeout=15, isolation_level=None)
+    # Restricted file permissions are necessary but not sufficient: use separate
+    # OS identities for Worker and trusted control services in production.
+    try:
+        os.chmod(file, 0o600)
+    except OSError:
+        conn.close()
+        raise
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
