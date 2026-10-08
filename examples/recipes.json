@@ -1,0 +1,10 @@
+{
+  "smoke.v1": {
+    "argv": ["python3", "-m", "bayesdesk.simjob"],
+    "cwd": ".",
+    "parameters": {
+      "duration": {"type": "integer", "flag": "--duration", "min": 0, "max": 30},
+      "result": {"type": "enum", "flag": "--result", "choices": ["pass", "fail"]}
+    }
+  }
+}
