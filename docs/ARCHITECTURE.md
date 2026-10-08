@@ -160,9 +160,9 @@ Prior-art references: [ARTEX](https://github.com/Autumn-27/ARTEX), [Cairn](https
 
 ## 9. Implementation/verification milestones
 
-**M0 (delivered):** executable Python stdlib protocol skeleton; SQLite leader; permit-bound job handoff; typed recipes; broker quote/submit; atomic multi-resource admission/backfill; detached/systemd launch adapters; result manifests; signed events; inbox dedup; escalation; tests.
+**M0 (delivered):** executable Python stdlib protocol skeleton; SQLite leader; permit-bound job handoff; typed recipes; broker quote/submit; atomic multi-resource admission/backfill; detached/systemd launch adapters; result manifests; signed events; inbox dedup; basic opt-in short-lived Worker launcher and Context Capsule; escalation; tests.
 
-**M1 (next):** read actual Shanxi queue shell script, preserve compatibility; onboard host and create trusted training recipes; correct `systemd` service user setup; simulate power loss and startup crash windows; automatic prepared-handoff reconciliation; Worker CLI adapter and current Task Capsule; evidence object store.
+**M1 (next):** read actual Shanxi queue shell script, preserve compatibility; onboard host and create trusted training recipes; correct `systemd` service user setup; simulate power loss and startup crash windows; automatic prepared-handoff reconciliation; production Worker CLI skills/permission adapter, token budgets and Context Capsule retrieval; evidence object store.
 
 **M2:** Japan OCI endpoint/mTLS and persistent event forwarding; PostgreSQL control plane; Gitea PR/CI adapter; verified source worktrees; structured diagnostics and resource budgeting; validated negative-knowledge lookup.
 

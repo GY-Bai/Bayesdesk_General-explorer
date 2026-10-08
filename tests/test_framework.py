@@ -101,6 +101,37 @@ class FrameworkTest(unittest.TestCase):
         self.assertIn(self.broker.status(jid3)["state"], ("STARTING", "RUNNING"))
         self.assertEqual(self._wait_terminal(jid3), "SUCCEEDED")
 
+    def test_two_dispatchers_do_not_overallocate_gpu(self):
+        from concurrent.futures import ThreadPoolExecutor
+        _, h1, j1 = self._prepare(profile={"cpu_units": 2, "memory_mib": 1024, "gpu_count": 1},
+                                  inputs={"duration": 1, "result": "pass"})
+        jid1 = self.broker.submit(j1)["job_id"]
+        self.leader.acknowledge_handoff(h1["handoff_id"], jid1)
+        self.leader.create_task("T2", "D1", "gpu study B", [], [], {})
+        _, h2, j2 = self._prepare(task_id="T2", profile={"cpu_units": 2, "memory_mib": 1024, "gpu_count": 1})
+        jid2 = self.broker.submit(j2)["job_id"]
+        self.leader.acknowledge_handoff(h2["handoff_id"], jid2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: self.broker.dispatch(limit=1), range(2)))
+        self.assertEqual(sum(len(x) for x in results), 1)
+        self.assertEqual(self.broker.inspect()["reserved"]["gpu_count"], 1)
+        self.assertEqual(self.broker.status(jid2)["state"], "QUEUED")
+        self.assertEqual(self._wait_terminal(jid1), "SUCCEEDED")
+        self.broker.dispatch(limit=1)
+        self.assertEqual(self._wait_terminal(jid2), "SUCCEEDED")
+
+    def test_expired_assignment_requeued_and_fenced(self):
+        from bayesdesk.storage import connect, write_tx
+        first = self.leader.assign("worker-a")
+        with connect(self.leader.path) as db, write_tx(db):
+            db.execute("UPDATE tasks SET lease_expires_at=0 WHERE id='T1'")
+        self.assertEqual(self.leader.requeue_expired()["requeued"], ["T1"])
+        second = self.leader.assign("worker-b")
+        self.assertGreater(second["generation"], first["generation"])
+        with self.assertRaises(ContractError) as ctx:
+            self.leader.complete("T1", "worker-a", first["generation"], ["old-evidence"])
+        self.assertEqual(ctx.exception.code, "STALE_ASSIGNMENT")
+
     def test_quote_is_not_reservation(self):
         q = self.broker.quote({"cpu_units": 4, "memory_mib": 4096, "gpu_count": 1})
         self.assertTrue(q["admission_now"])
