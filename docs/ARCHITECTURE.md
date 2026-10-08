@@ -102,7 +102,7 @@ Node administrator registers an immutable `recipe_id` with a fixed `argv` prefix
 
 ### Scheduling policy
 
-Jobs are ordered by priority and insertion order, not by randomized IDs. The broker reserves CPU, RAM and GPU atomically. If queue head is blocked, later jobs can backfill **only while preserving enough CPU and RAM for the blocked head**; this protects a pending GPU training job against indefinite CPU-side starvation. No automatic GPU preemption or unapproved resource shrinking. A Worker can choose a compact profile before submit or submit a full profile to wait; the Broker never invents another scientific configuration.
+Jobs are ordered by priority (V1 submissions default to equal priority) and insertion order, not by randomized IDs. The broker reserves CPU, RAM and GPU atomically. If queue head is blocked, later jobs can backfill **only while preserving enough CPU and RAM for the blocked head**; this protects a pending GPU training job against indefinite CPU-side starvation. No automatic GPU preemption or unapproved resource shrinking. A Worker can choose a compact profile before submit or submit a full profile to wait; the Broker never invents another scientific configuration.
 
 ### Job completion
 
@@ -122,7 +122,7 @@ Exact keys:
 
 `schema_version`, `handoff_id`, `task_id`, `attempt_id`, `decision_id`, `generation`, `source_commit`, `recipe_id`, `inputs`, `profile_name`, `profile`, `timeout_seconds`, `permit`.
 
-A permit is an HMAC-SHA256 over immutable claims: handoff, task, attempt, Decision, Worker generation, recipe, approved profiles, max walltime and expiry. Broker validates its signature and selected resources. Worker cannot submit arbitrary NLP text as executable instructions.
+A permit is an HMAC-SHA256 over immutable claims: handoff, task, attempt, Decision, Worker generation, recipe, **source commit**, approved profiles, max walltime and expiry. Broker validates its signature and selected resources. Worker cannot submit arbitrary NLP text as executable instructions.
 
 ### Escalation Contract
 

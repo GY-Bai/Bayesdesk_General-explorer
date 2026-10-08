@@ -183,14 +183,16 @@ class Broker:
                     break
                 db.execute("UPDATE jobs SET state='STARTING',updated_at=? WHERE job_id=? AND state='QUEUED'",
                            (utcnow(), chosen["job_id"]))
-            spec = json.loads(chosen["spec_json"])
-            folder = self._job_dir(chosen["job_id"])
-            folder.mkdir(parents=True, exist_ok=True)
-            argv, cwd = render_recipe(self.recipes[chosen["recipe_id"]], spec["inputs"])
-            entry = folder / "entry.json"
-            atomic_json(entry, {"job_id": chosen["job_id"], "job_dir": str(folder),
-                                "argv": argv, "cwd": cwd, "timeout_seconds": spec["timeout_seconds"]})
+            # File/recipe preparation and OS launch share the same safety fence:
+            # any uncertain side effect leaves UNKNOWN reserved, never auto-replayed.
             try:
+                spec = json.loads(chosen["spec_json"])
+                folder = self._job_dir(chosen["job_id"])
+                folder.mkdir(parents=True, exist_ok=True)
+                argv, cwd = render_recipe(self.recipes[chosen["recipe_id"]], spec["inputs"])
+                entry = folder / "entry.json"
+                atomic_json(entry, {"job_id": chosen["job_id"], "job_dir": str(folder),
+                                    "argv": argv, "cwd": cwd, "timeout_seconds": spec["timeout_seconds"]})
                 meta = self.executor.start(chosen["unit_name"], entry, chosen["cpu_units"], chosen["memory_mib"])
                 with connect(self.path) as db, write_tx(db):
                     db.execute("UPDATE jobs SET executor_meta=?,state='RUNNING',started_at=?,updated_at=? WHERE job_id=? AND state='STARTING'",

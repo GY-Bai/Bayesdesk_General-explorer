@@ -164,7 +164,7 @@ class Leader:
             attempt_id = "ATT-" + uuid.uuid4().hex[:20]
             claims = {"handoff_id": handoff_id, "task_id": task_id, "attempt_id": attempt_id,
                       "decision_id": task["decision_id"], "generation": generation, "recipe_id": recipe_id,
-                      "allowed_profiles": allowed_profiles, "max_timeout_seconds": max_timeout_seconds,
+                      "source_commit": source_commit, "allowed_profiles": allowed_profiles, "max_timeout_seconds": max_timeout_seconds,
                       "expires_at": int(time.time()) + permit_ttl_seconds}
             permit = sign_permit(self.secret, claims)
             db.execute("INSERT INTO handoffs VALUES(?,?,?,?,? ,NULL,?,?,?,?)",

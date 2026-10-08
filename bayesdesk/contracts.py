@@ -65,13 +65,13 @@ def verify_permit(secret: str, job: dict) -> None:
     exact_keys(permit, {"claims", "signature"})
     claims = permit["claims"]
     exact_keys(claims, {"handoff_id", "task_id", "attempt_id", "decision_id", "generation",
-                        "recipe_id", "allowed_profiles", "max_timeout_seconds", "expires_at"})
+                        "recipe_id", "source_commit", "allowed_profiles", "max_timeout_seconds", "expires_at"})
     expected = sign_permit(secret, claims)["signature"]
     require(isinstance(permit["signature"], str) and hmac.compare_digest(permit["signature"], expected),
             "INVALID_PERMIT", "permit signature mismatch")
     require(type(claims["expires_at"]) is int and time.time() < claims["expires_at"],
             "EXPIRED_PERMIT", "worker handoff permit expired")
-    for key in ("handoff_id", "task_id", "attempt_id", "decision_id", "generation", "recipe_id"):
+    for key in ("handoff_id", "task_id", "attempt_id", "decision_id", "generation", "recipe_id", "source_commit"):
         require(job[key] == claims[key], "INVALID_PERMIT", f"permit does not authorize {key}")
     profiles = claims["allowed_profiles"]
     require(isinstance(profiles, dict) and job["profile_name"] in profiles,

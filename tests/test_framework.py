@@ -113,6 +113,21 @@ class FrameworkTest(unittest.TestCase):
             self.broker.submit(job)
         self.assertEqual(ctx.exception.code, "PROFILE_NOT_APPROVED")
 
+    def test_broker_permit_binds_source_commit(self):
+        _, _, job = self._prepare()
+        job["source_commit"] = "b" * 40
+        with self.assertRaises(ContractError) as ctx:
+            self.broker.submit(job)
+        self.assertEqual(ctx.exception.code, "INVALID_PERMIT")
+
+    def test_concurrent_idempotent_submission(self):
+        from concurrent.futures import ThreadPoolExecutor
+        _, _, job = self._prepare()
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            outputs = list(pool.map(lambda _: self.broker.submit(job), range(5)))
+        self.assertEqual(len({x["job_id"] for x in outputs}), 1)
+        self.assertEqual(self.broker.inspect()["queued"], 1)
+
     def test_broker_rejects_arbitrary_input(self):
         _, _, job = self._prepare()
         job["inputs"]["unsafe_shell"] = "rm -rf /"
